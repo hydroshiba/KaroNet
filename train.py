@@ -244,3 +244,9 @@ if __name__ == "__main__":
 				writer.writerow([idx + 1, op_stage + 1, wins, draws, losses, elos[idx + 1], elos[op_stage]])
     
 	print(f"Model and snapshots saved to {path}")
+
+	# Call evaluate.py on the newly trained model folder
+	import subprocess
+	import sys
+	print(f"Running evaluation on {path}...")
+	subprocess.run([sys.executable, "evaluate.py", "--path", path, "--rounds", "100"])

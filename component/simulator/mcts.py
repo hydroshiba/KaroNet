@@ -258,8 +258,8 @@ class MCTS:
 			visit_dist[best] = 1.0
 			return best, visit_dist
 
-		powered                 = visits.pow(1.0 / temp)
-		probs                   = powered / powered.sum()
+		logits                  = torch.log(visits + 1e-9) / temp
+		probs                   = torch.softmax(logits, dim=0)
 		visit_dist[legal_moves] = probs
 		move                    = legal_moves[torch.multinomial(probs, 1).item()]
 		return move, visit_dist

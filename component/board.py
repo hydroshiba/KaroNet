@@ -88,7 +88,7 @@ class Board:
 		return self.board.view(self.size, self.size)
 
 	def clone(self):
-		new             = Gomoku.__new__(Gomoku)
+		new             = Board.__new__(Board)
 		new.size        = self.size
 		new.win_length  = self.win_length
 		new._board_np   = self._board_np.copy()       # pure numpy copy, no .numpy() overhead

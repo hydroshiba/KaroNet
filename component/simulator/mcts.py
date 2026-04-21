@@ -3,6 +3,8 @@ import math
 import numpy as np
 from tqdm import tqdm
 
+_NEG_INF = float('-inf')  # module-level constant; avoids float('-inf') allocation per call
+
 
 class MCTSNode:
 	"""
@@ -14,24 +16,36 @@ class MCTSNode:
 	rather than creating child nodes. np.argmax on the priors array is a
 	C-level operation, replacing the O(n) Python max() dict scan.
 	Child MCTSNode objects are created on demand during _select.
+
+	_children_list   : ordered list of child MCTSNodes (insertion order).
+	                   Used by _select for direct list iteration (faster than
+	                   dict.values() which allocates a view object each call).
+	_vl_dirty        : count of children currently with virtual_loss > 0.
+	                   When 0 (the common case) the PUCT loop skips the per-child
+	                   VL attribute read and branch entirely.
+	                   Incremented when VL is applied to a child; decremented in
+	                   _backprop when VL is removed.
 	"""
 	__slots__ = ('parent', 'move', 'player', 'children',
 	             'W', 'N', 'prior', 'board', 'virtual_loss',
-	             '_unexp_moves', '_unexp_priors', '_child_player')
+	             '_unexp_moves', '_unexp_priors', '_child_player',
+	             '_children_list', '_vl_dirty')
 
 	def __init__(self, parent, move, player, prior, board=None):
-		self.parent         = parent
-		self.move           = move
-		self.player         = player
-		self.children       = {}
-		self.W              = 0.0
-		self.N              = 0
-		self.prior          = prior
-		self.board          = board
-		self.virtual_loss   = 0
-		self._unexp_moves   = None   # np.ndarray int32 (slice view, swap-and-shrink)
-		self._unexp_priors  = None   # np.ndarray float32
-		self._child_player  = 0
+		self.parent          = parent
+		self.move            = move
+		self.player          = player
+		self.children        = {}
+		self.W               = 0.0
+		self.N               = 0
+		self.prior           = prior
+		self.board           = board
+		self.virtual_loss    = 0
+		self._unexp_moves    = None   # np.ndarray int32 (slice view, swap-and-shrink)
+		self._unexp_priors   = None   # np.ndarray float32
+		self._child_player   = 0
+		self._children_list  = []     # ordered child refs for O(1) list iteration
+		self._vl_dirty       = 0      # count of children with virtual_loss > 0
 
 
 class MCTS:
@@ -70,7 +84,8 @@ class MCTS:
 	             temperature=1.0,
 				 temp_decay=0.95,
 				 temp_min=0.05,
-	             virtual_loss_weight=1.0):
+	             virtual_loss_weight=1.0,
+                 value_blend_lambda=0.5):
 		self.parallel            = parallel
 		self.wave_size           = wave_size
 		self.c_puct              = c_puct
@@ -80,6 +95,7 @@ class MCTS:
 		self.virtual_loss_weight = virtual_loss_weight
 		self.temp_decay          = temp_decay
 		self.temp_min            = temp_min
+		self.value_blend_lambda  = value_blend_lambda
 
 	# ── Clone validation ──────────────────────────────────────────────────────
 	def _validate_clone(self, board):
@@ -109,26 +125,46 @@ class MCTS:
 			node.board = node.parent.board.clone()
 			node.board.make_move(node.move, node.parent.player)
 
-	# ── PUCT selection ────────────────────────────────────────────────────────
+	# ── PUCT selection (virtual loss applied inline during descent) ───────────
 	def _select(self, root):
-		node = root
+		node      = root
+		c_puct    = self.c_puct
+		vl_weight = self.virtual_loss_weight
+		node.virtual_loss += 1              # apply VL to root
 		while node.children or node._unexp_moves is not None:
-			sqrt_N     = math.sqrt(node.N + 1)
-			best_score = -float('inf')
+			cpsn       = c_puct * math.sqrt(node.N + 1)  # precomputed c_puct * sqrt_N
+			best_score = _NEG_INF
 			best_child = None
-			c_puct     = self.c_puct
-			vl_weight  = self.virtual_loss_weight
 
-			# Score expanded children
-			for child in node.children.values():
-				effective_n = child.N + child.virtual_loss
-				effective_w = child.W + child.virtual_loss * vl_weight
-				q     = -(effective_w / effective_n) if effective_n > 0 else 0.0
-				u     = c_puct * child.prior * sqrt_N / (1 + effective_n)
-				score = q + u
-				if score > best_score:
-					best_score = score
-					best_child = child
+			# Score expanded children.
+			# _vl_dirty is a count of children currently carrying virtual loss.
+			# When 0 (the common case — all siblings unselected in this wave),
+			# skip every per-child VL attribute read and branch entirely.
+			children_list = node._children_list
+			if not node._vl_dirty:
+				# ── Fast path: no child has in-flight VL ─────────────────────
+				for child in children_list:
+					n     = child.N
+					q     = -child.W / n if n else 0.0
+					score = q + cpsn * child.prior / (1 + n)
+					if score > best_score:
+						best_score = score
+						best_child = child
+			else:
+				# ── Slow path: at least one child has VL — check individually ──
+				for child in children_list:
+					vl = child.virtual_loss
+					if vl:
+						eff_n = child.N + vl
+						q     = -(child.W + vl * vl_weight) / max(eff_n, 1)
+						score = q + cpsn * child.prior / (1 + eff_n)
+					else:
+						n     = child.N
+						q     = -child.W / n if n else 0.0
+						score = q + cpsn * child.prior / (1 + n)
+					if score > best_score:
+						best_score = score
+						best_child = child
 
 			# Check best unexpanded move (N=0 → score = c_puct * prior * sqrt_N)
 			# .argmax() method avoids numpy wrapper overhead vs np.argmax()
@@ -136,7 +172,7 @@ class MCTS:
 			if unexp_priors is not None:
 				idx        = int(unexp_priors.argmax())
 				top_prior  = float(unexp_priors[idx])
-				u_unexp    = c_puct * top_prior * sqrt_N
+				u_unexp    = cpsn * top_prior
 				if u_unexp > best_score:
 					best_unexp_mv = node._unexp_moves[idx]
 					# Swap-and-shrink: O(1), numpy slice view (no realloc)
@@ -151,29 +187,22 @@ class MCTS:
 						player=node._child_player,
 						prior=top_prior, board=None,
 					)
+					# Register child in ordered list
+					node._children_list.append(child)
 					node.children[best_unexp_mv] = child
+					child.virtual_loss += 1          # apply VL to new leaf
+					node._vl_dirty     += 1          # one more dirty child
 					self._materialise(child)
 					return child  # New leaf — needs evaluation
 
 			if best_child is None:
 				break
 
+			best_child.virtual_loss += 1     # apply VL as we descend
+			node._vl_dirty          += 1     # one more dirty child
 			self._materialise(best_child)
 			node = best_child
 		return node
-
-	# ── Virtual loss ──────────────────────────────────────────────────────────
-	def _apply_virtual_loss(self, node):
-		cur = node
-		while cur is not None:
-			cur.virtual_loss += 1
-			cur = cur.parent
-
-	def _remove_virtual_loss(self, node):
-		cur = node
-		while cur is not None:
-			cur.virtual_loss -= 1
-			cur = cur.parent
 
 	# ── Expansion ─────────────────────────────────────────────────────────────
 	def _expand(self, node, pol_np, value):
@@ -220,14 +249,17 @@ class MCTS:
 				unexp_priors[j] = one_minus_frac * float(unexp_priors[j]) + frac * noise[n_exp + j]
 			# priors updated in-place; no need to replace _unexp_priors
 
-	# ── Backpropagation ───────────────────────────────────────────────────────
+	# ── Backpropagation (virtual loss removed inline) ─────────────────────────
 	def _backprop(self, node, value):
-		sign = 1
 		while node is not None:
-			node.N += 1
-			node.W += value * sign
-			sign   *= -1
-			node    = node.parent
+			node.N            += 1
+			node.W            += value
+			node.virtual_loss -= 1      # remove VL applied during _select
+			parent             = node.parent
+			if parent is not None:
+				parent._vl_dirty -= 1   # one fewer dirty child
+			value = -value
+			node  = parent
 
 	# ── Move selection ────────────────────────────────────────────────────────
 	def _pick_move(self, root, num_cells, move_number):
@@ -258,14 +290,22 @@ class MCTS:
 			visit_dist[best] = 1.0
 			return best, visit_dist
 
-		logits                  = torch.log(visits + 1e-9) / temp
-		probs                   = torch.softmax(logits, dim=0)
+		powered                 = visits.pow(1.0 / temp)
+		powered_sum             = powered.sum()
+
+		if powered_sum <= 0 or torch.isnan(powered_sum):
+			probs = torch.ones(len(legal_moves)) / len(legal_moves)
+		else:
+			probs = powered / powered_sum
+			if torch.isnan(probs).any() or probs.sum() <= 0:
+				probs = torch.ones(len(legal_moves)) / len(legal_moves)
+
 		visit_dist[legal_moves] = probs
 		move                    = legal_moves[torch.multinomial(probs, 1).item()]
 		return move, visit_dist
 
 	# ── Core: parallel games with wave-batched inference ─────────────────────
-	def _run_parallel(self, board_class, agent1, agent2, n, pbar, simulations):
+	def _run_parallel(self, board_class, agent1, agent2, n, pbar, X_sims, O_sims):
 		boards    = [board_class() for _ in range(n)]
 		players   = [1]     * n
 		logs      = [[]     for _ in range(n)]
@@ -291,14 +331,15 @@ class MCTS:
 			noise_applied = {i: False for i in active}
 			sims_done     = {i: 0 for i in active}
 
-			while any(sims_done[i] < simulations for i in active):
+			while any(sims_done[i] < (X_sims if players[i] == 1 else O_sims) for i in active):
 
 				# ── Collect one wave of leaves ────────────────────────────────
 				terminal_nodes     = []   # (game_idx, node, value)
 				non_terminal_nodes = []   # (game_idx, node)
 
 				for i in active:
-					remaining = simulations - sims_done[i]
+					target_sims = X_sims if players[i] == 1 else O_sims
+					remaining = target_sims - sims_done[i]
 					if remaining <= 0:
 						continue
 					n_wave = min(self.wave_size, remaining)
@@ -311,7 +352,6 @@ class MCTS:
 						if res != 0 or brd._n_empty == 0:
 							terminal_nodes.append((i, node, float(res * node.player)))
 						else:
-							self._apply_virtual_loss(node)
 							non_terminal_nodes.append((i, node))
 
 					# Dirichlet noise after root's first expansion
@@ -347,7 +387,6 @@ class MCTS:
 								pol_np[j],
 								val_list[j],
 							)
-							self._remove_virtual_loss(node)
 							self._backprop(node, value)
 							sims_done[i] += 1
 
@@ -359,8 +398,9 @@ class MCTS:
 			# ── Advance each active game by one move ──────────────────────────
 			for i in active:
 				move, visit_dist = self._pick_move(roots[i], num_cells, len(logs[i]))
+				q = roots[i].W / roots[i].N if roots[i].N > 0 else 0.0
 				logs[i].append(
-					(boards[i].board.clone(), players[i], move, visit_dist)
+					(boards[i].board.clone(), players[i], move, visit_dist, q)
 				)
 				boards[i].make_move(move, players[i])
 				players[i] *= -1
@@ -371,15 +411,16 @@ class MCTS:
 					pbar.update(1)
 
 		games = []
+		lam = self.value_blend_lambda
 		for i in range(n):
 			games.append([
-				(state, pl, mv, policy, results[i])
-				for state, pl, mv, policy in logs[i]
+				(state, pl, mv, policy, lam * results[i] + (1 - lam) * (q * pl))
+				for state, pl, mv, policy, q in logs[i]
 			])
 		return games
 
 	# ── Public interface ──────────────────────────────────────────────────────
-	def simulate(self, board, agent1, agent2, rounds=256, simulations=100):
+	def simulate(self, board, agent1, agent2, rounds=256, X_sims=100, O_sims=100):
 		agent1.model.eval()
 		agent2.model.eval()
 		board_class = type(board)
@@ -392,9 +433,11 @@ class MCTS:
 		i = 0
 		while i < rounds:
 			batch_n = min(self.parallel, rounds - i)
-			batch   = self._run_parallel(board_class, agent1, agent2, batch_n, pbar, simulations)
+			batch   = self._run_parallel(board_class, agent1, agent2, batch_n, pbar, X_sims, O_sims)
 			games.extend(batch)
 			i += batch_n
 
 		pbar.close()
+		if torch.cuda.is_available():
+			torch.cuda.synchronize()
 		return games

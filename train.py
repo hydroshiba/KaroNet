@@ -1,6 +1,7 @@
 import torch
 import copy
 import os
+import gc
 import csv
 import datetime
 import random
@@ -127,7 +128,112 @@ def compute_elos(snapshot_perf, num_stages):
 	elos = 1000.0 + 400.0 * np.log10(gamma)
 	return elos.tolist()
 
+def seed_everything(seed):
+	random.seed(seed)
+	os.environ['PYTHONHASHSEED'] = str(seed)
+	np.random.seed(seed)
+	torch.manual_seed(seed)
+	torch.cuda.manual_seed(seed)
+	torch.cuda.manual_seed_all(seed)
+	torch.backends.cudnn.deterministic = True
+	torch.backends.cudnn.benchmark = False
+ 
+def augment_games(games):
+	if not games:
+		return []
+
+	size = int(games[0][0][0].shape[0] ** 0.5)
+
+	states, players, moves, policies, results = [], [], [], [], []
+	game_boundaries = [0]
+	
+	for game in games:
+		for state, player, move, policy, result in game:
+			states.append(state)
+			players.append(player)
+			moves.append(move)
+			policies.append(policy)
+			results.append(result)
+		game_boundaries.append(len(states))
+		
+	num_steps = len(states)
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	
+	states_t = torch.stack(states).to(device).view(num_steps, size, size)
+	policies_t = torch.stack(policies).to(device).view(num_steps, size, size)
+	moves_t = torch.tensor(moves, device=device)
+	
+	moves_y = moves_t // size
+	moves_x = moves_t % size
+	
+	aug_states, aug_policies, aug_moves = [], [], []
+	
+	for rot in range(4):
+		for flip in [False, True]:
+			s_2d = torch.rot90(states_t, k=rot, dims=[1, 2])
+			p_2d = torch.rot90(policies_t, k=rot, dims=[1, 2])
+			
+			m_y, m_x = moves_y.clone(), moves_x.clone()
+			for _ in range(rot):
+				m_y, m_x = size - 1 - m_x, m_y.clone()
+				
+			if flip:
+				s_2d = torch.flip(s_2d, dims=[2])
+				p_2d = torch.flip(p_2d, dims=[2])
+				m_x = size - 1 - m_x
+				
+			aug_states.append(s_2d.reshape(num_steps, -1).cpu())
+			aug_policies.append(p_2d.reshape(num_steps, -1).cpu())
+			aug_moves.extend((m_y * size + m_x).cpu().tolist())
+			
+	cat_states = torch.cat(aug_states, dim=0)
+	cat_policies = torch.cat(aug_policies, dim=0)
+	
+	# Since players and results are invariant, extend them 8x
+	all_players = players * 8
+	all_results = results * 8
+	
+	new_games = []
+	for i in range(8):
+		offset = i * num_steps
+		for j in range(len(games)):
+			start = offset + game_boundaries[j]
+			end = offset + game_boundaries[j+1]
+			
+			game_list = [
+				(
+					cat_states[k],
+					all_players[k],
+					aug_moves[k],
+					cat_policies[k],
+					all_results[k]
+				)
+				for k in range(start, end)
+			]
+			new_games.append(game_list)
+			
+	return new_games
+
+def increase_O(games, percentage = 0.25): # Should NEVER be used with DeepQ
+	for game in games:
+		# Filter positions from games where O won
+		# An O win is identifiable by a negative evaluation value and the last move being O's
+		if game[-1][1] == -1 and game[-1][-1] < 0:
+			o_positions = [step for step in game if step[1] == -1]
+			target_amount = int(len(game) * percentage)
+			if target_amount > 0 and o_positions:
+				if len(o_positions) >= target_amount:
+					game.extend(random.sample(o_positions, target_amount))
+				else:
+					game.extend(random.choices(o_positions, k=target_amount))
+	
+	return games
+
 if __name__ == "__main__":
+    # Set fixed seed
+	seed = 97
+	seed_everything(seed)
+	
 	model = architecture.GomokuNet()
 	eval_rounds = 1000
 
@@ -136,22 +242,30 @@ if __name__ == "__main__":
 	snapshot_perf = []
 	snapshot_elos = []
 	games = []
-	round_schedule = [256 for i in range(256)]
+	round_schedule = [256 for i in range(256)] + [512 for i in range(256)]
 
-	epochs = 10
-	buffer_size = 131072 # Virtually unlimited
-	train_size = 2048
-	optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+	epochs = 5
+	buffer_size = 131072
+	train_size = 2048 * 8
+	optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 	scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
 		optimizer, T_0=32, T_mult=1, eta_min=1e-5
 	)
- 
+
 	mcts_sims = 100.0
+	mcts_O_sims_ratio = 1.5
 	mcts_sims_gamma = 1.01089
 	mcts_sims_max = 1600.0
  
-	sim = simulator.MCTS(temperature=1.0, parallel=256, dirichlet_alpha=0.03, dirichlet_frac=0.25, temp_decay=0.95, temp_min=0.05)
 	trn = trainer.MonteCarlo(optimizer, loss.AlphaZero(), loss_freq=1)
+	sim = simulator.MCTS(
+    	temperature=1.0,
+		temp_decay=0.98,
+		temp_min=0.05,
+    	parallel=256, wave_size=8,
+    	dirichlet_alpha=0.3,
+    	dirichlet_frac=0.25
+    )
 	
 	latest_elos = [1000.0]
 	
@@ -168,6 +282,11 @@ if __name__ == "__main__":
 	print("=" * 97)
 
 	for i, rounds in enumerate(round_schedule):
+		# Clear GPU cache to prevent OOM issues during self-play and training
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+    
 		# Save snapshot before training to evaluate against it later and track progress
 		snapshots.append(copy.deepcopy(model))
 		
@@ -180,12 +299,14 @@ if __name__ == "__main__":
 			opponent_idx = 0
 			print("Opponent: Itself (first iteration)")
 		else:
-			valid_indices = [j for j in queue_indices if j in snapshot_perf[-1]]
+			valid_indices = [j for j in queue_indices if j in snapshot_perf[-1] and j != 0]
 			if valid_indices:
-				opponent_idx = max(valid_indices, key=lambda j: (snapshot_perf[-1][j][2], j))
+				top_opponents = sorted(valid_indices, key=lambda j: snapshot_perf[-1][j][2], reverse=True)[:3]
+				opponent_idx = random.choice(top_opponents)
 				losses = snapshot_perf[-1][opponent_idx][2]
 			else:
-				opponent_idx = random.choice(queue_indices)
+				valid_queue = [j for j in queue_indices if j != 0]
+				opponent_idx = random.choice(valid_queue) if valid_queue else 0
 				losses = "?"
 			elo = latest_elos[opponent_idx]
 			print(f"Opponent: {ordinal(opponent_idx)} snapshot with Elo {elo:.2f} (Losses: {losses})")
@@ -193,7 +314,18 @@ if __name__ == "__main__":
 		current = agent.Neural(model)
 		opponent = agent.Neural(snapshots[opponent_idx])
 
-		current_games = sim.simulate(board.Board(), agent1 = current, agent2 = opponent, rounds=rounds, simulations=int(mcts_sims))
+		simulations = int(mcts_sims)
+		current_games = sim.simulate(
+    		board.Board(),
+    		agent1 = current,
+    		agent2 = opponent,
+      		rounds = rounds,
+    		X_sims = simulations,
+			O_sims = int(simulations * mcts_O_sims_ratio)
+		)
+		
+		current_games = increase_O(current_games, 1.0) # More O player data to balance it out
+		current_games = augment_games(current_games) # 8x augmentation
 		games.extend(current_games)
 		games = games[-buffer_size:]
 
@@ -211,7 +343,8 @@ if __name__ == "__main__":
 		print("Evaluating against previous snapshots opening with first 4 random moves:")
 		performance = {}
 
-		eval_queue = sorted(list(set(queue_indices + [len(snapshots)])))
+		eval_queue = queue_indices + [len(snapshots)] + [i for i in range(0, len(snapshots), 32)]
+		eval_queue = sorted(list(set(eval_queue)))  # Remove duplicates
 		
 		for stage in eval_queue:
 			print(f"{ordinal(i + 1)} stage vs {ordinal(stage)} snapshot:" if stage < len(snapshots) else f"{ordinal(i + 1)} stage vs Itself:")

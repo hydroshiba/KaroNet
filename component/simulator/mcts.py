@@ -85,7 +85,9 @@ class MCTS:
 				 temp_decay=0.95,
 				 temp_min=0.05,
 	             virtual_loss_weight=1.0,
-                 value_blend_lambda=0.5):
+                 value_blend_lambda=0.5,
+                 value_blend_decay=1.0,
+                 value_blend_min=0.5):
 		self.parallel            = parallel
 		self.wave_size           = wave_size
 		self.c_puct              = c_puct
@@ -96,6 +98,8 @@ class MCTS:
 		self.temp_decay          = temp_decay
 		self.temp_min            = temp_min
 		self.value_blend_lambda  = value_blend_lambda
+		self.value_blend_decay   = value_blend_decay
+		self.value_blend_min	 = value_blend_min
 
 	# ── Clone validation ──────────────────────────────────────────────────────
 	def _validate_clone(self, board):
@@ -440,4 +444,5 @@ class MCTS:
 		pbar.close()
 		if torch.cuda.is_available():
 			torch.cuda.synchronize()
+		self.value_blend_lambda = max(self.value_blend_min, self.value_blend_lambda * self.value_blend_decay)
 		return games

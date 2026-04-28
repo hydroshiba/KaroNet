@@ -36,7 +36,6 @@ def evaluate(gameboard, agent1, agent2, rounds=1000, k=3):
 	wins = [0, 0]
 	draws = [0, 0]
 
-	pbar = tqdm(total=rounds)
 	for config in range(2):
 		agent_x = agent1 if config == 0 else agent2
 		agent_o = agent2 if config == 0 else agent1
@@ -73,16 +72,14 @@ def evaluate(gameboard, agent1, agent2, rounds=1000, k=3):
 				else:
 					still_active.append(idx)
 
-			pbar.update(len(active) - len(still_active))
 			active = still_active
 			step += 1
 
-	pbar.close()
 	losses = [half - wins[0] - draws[0], half - wins[1] - draws[1]]
-	print(f"{'':10} {'as X':>6} {'as O':>6} {'Percentage':>10}")
-	print(f"{'Wins':10} {wins[0]:>6} {wins[1]:>6}" + f" {(wins[0] + wins[1]) / rounds * 100:>9.2f}%")
-	print(f"{'Draws':10} {draws[0]:>6} {draws[1]:>6}" + f" {(draws[0] + draws[1]) / rounds * 100:>9.2f}%")
-	print(f"{'Losses':10} {losses[0]:>6} {losses[1]:>6}" + f" {(losses[0] + losses[1]) / rounds * 100:>9.2f}%")
+	# print(f"{'':10} {'as X':>6} {'as O':>6} {'Percentage':>10}")
+	# print(f"{'Wins':10} {wins[0]:>6} {wins[1]:>6}" + f" {(wins[0] + wins[1]) / rounds * 100:>9.2f}%")
+	# print(f"{'Draws':10} {draws[0]:>6} {draws[1]:>6}" + f" {(draws[0] + draws[1]) / rounds * 100:>9.2f}%")
+	# print(f"{'Losses':10} {losses[0]:>6} {losses[1]:>6}" + f" {(losses[0] + losses[1]) / rounds * 100:>9.2f}%")
 
 	return (wins, draws, losses)
 
@@ -92,14 +89,15 @@ def ordinal(n):
 
 def compute_elos(snapshot_perf, num_stages):
 	# Minorize-Maximization for Bradley-Terry MLE
-	wins = np.ones((num_stages, num_stages)) * 0.5  # Laplace smoothing prior
-	games = np.ones((num_stages, num_stages)) * 1.0
+	wins = np.ones((num_stages, num_stages)) * 0.005  # Laplace smoothing prior
+	games = np.ones((num_stages, num_stages)) * 0.01
 	np.fill_diagonal(wins, 0)
 	np.fill_diagonal(games, 0)
 
 	for idx, perf in enumerate(snapshot_perf):
 		stage1 = idx + 1
-		for stage2, (w, d, l) in perf.items():
+		for stage2, stats in perf.items():
+			w, d, l = stats[0], stats[1], stats[2]
 			wins[stage1, stage2] += w + (d / 2.0)
 			wins[stage2, stage1] += l + (d / 2.0)
 			games[stage1, stage2] += w + d + l
@@ -242,29 +240,32 @@ if __name__ == "__main__":
 	snapshot_perf = []
 	snapshot_elos = []
 	games = []
-	round_schedule = [256 for i in range(256)] + [512 for i in range(256)]
+	round_schedule = [128 for i in range(1024)]
 
 	epochs = 5
-	buffer_size = 131072
-	train_size = 2048 * 8
+	buffer_size = 1048576
+	train_size = 8192
 	optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 	scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
 		optimizer, T_0=32, T_mult=1, eta_min=1e-5
 	)
 
-	mcts_sims = 100.0
-	mcts_O_sims_ratio = 1.5
-	mcts_sims_gamma = 1.01089
-	mcts_sims_max = 1600.0
+	mcts_sims = 200.0
+	mcts_O_sims_ratio = 1.6
+	mcts_sims_gamma = 1.021897
+	mcts_sims_max = 1200.0
  
-	trn = trainer.MonteCarlo(optimizer, loss.AlphaZero(), loss_freq=1)
+	trn = trainer.MonteCarlo(optimizer, loss.AlphaZero(policy_weight=0.5, value_weight=0.5), loss_freq=1)
 	sim = simulator.MCTS(
     	temperature=1.0,
 		temp_decay=0.98,
 		temp_min=0.05,
-    	parallel=256, wave_size=8,
+    	parallel=128, wave_size=8,
     	dirichlet_alpha=0.3,
-    	dirichlet_frac=0.25
+    	dirichlet_frac=0.25,
+		value_blend_lambda=1.0,
+		value_blend_decay=0.998876,
+		value_blend_min=0.8
     )
 	
 	latest_elos = [1000.0]
@@ -299,17 +300,23 @@ if __name__ == "__main__":
 			opponent_idx = 0
 			print("Opponent: Itself (first iteration)")
 		else:
-			valid_indices = [j for j in queue_indices if j in snapshot_perf[-1] and j != 0]
-			if valid_indices:
-				top_opponents = sorted(valid_indices, key=lambda j: snapshot_perf[-1][j][2], reverse=True)[:3]
-				opponent_idx = random.choice(top_opponents)
-				losses = snapshot_perf[-1][opponent_idx][2]
+			if random.randint(0, 19) == 0:
+				# Occasionally evaluate against a random snapshot from past anchors for more diverse feedback
+				indices = list(range(0, len(snapshots), 32))
+				opponent_idx = random.choice(indices) if indices else 0
 			else:
-				valid_queue = [j for j in queue_indices if j != 0]
-				opponent_idx = random.choice(valid_queue) if valid_queue else 0
-				losses = "?"
+				valid_indices = [j for j in queue_indices if j in snapshot_perf[-1] and j != 0]
+				if valid_indices:
+					top_opponents = sorted(valid_indices, key=lambda j: snapshot_perf[-1][j][2], reverse=True)[:3]
+					opponent_idx = random.choice(top_opponents)
+					losses = snapshot_perf[-1][opponent_idx][2]
+				else:
+					valid_queue = [j for j in queue_indices if j != 0]
+					opponent_idx = random.choice(valid_queue) if valid_queue else 0
+					losses = "?"
+			
 			elo = latest_elos[opponent_idx]
-			print(f"Opponent: {ordinal(opponent_idx)} snapshot with Elo {elo:.2f} (Losses: {losses})")
+			print(f"Opponent: {ordinal(opponent_idx)} snapshot with Elo {elo:.2f}")
 
 		current = agent.Neural(model)
 		opponent = agent.Neural(snapshots[opponent_idx])
@@ -323,8 +330,17 @@ if __name__ == "__main__":
     		X_sims = simulations,
 			O_sims = int(simulations * mcts_O_sims_ratio)
 		)
+
+		print(f"{len(current_games)} self-played games statistics:")
+		print(f"Longest game: {max(len(g) for g in current_games)} plies")
+		print(f"Shortest game: {min(len(g) for g in current_games)} plies")
+		print(f"Average game length: {sum(len(g) for g in current_games) / len(current_games):.2f} plies")
+		print(f"X wins: {sum(1 for g in current_games if g[-1][-1] > 0)}")
+		print(f"O wins: {sum(1 for g in current_games if g[-1][-1] < 0)}")
+		print(f"Draws: {sum(1 for g in current_games if g[-1][-1] == 0)}")
+		print('-' * 50)
 		
-		current_games = increase_O(current_games, 1.0) # More O player data to balance it out
+		current_games = increase_O(current_games, 1.25) # More O player data to balance it out
 		current_games = augment_games(current_games) # 8x augmentation
 		games.extend(current_games)
 		games = games[-buffer_size:]
@@ -340,18 +356,16 @@ if __name__ == "__main__":
 		trn.train(model, train_games, epochs=epochs, batch_size=128)
 		
 		# Evaluate against snapshots
-		print("Evaluating against previous snapshots opening with first 4 random moves:")
 		performance = {}
-
 		eval_queue = queue_indices + [len(snapshots)] + [i for i in range(0, len(snapshots), 32)]
 		eval_queue = sorted(list(set(eval_queue)))  # Remove duplicates
 		
-		for stage in eval_queue:
-			print(f"{ordinal(i + 1)} stage vs {ordinal(stage)} snapshot:" if stage < len(snapshots) else f"{ordinal(i + 1)} stage vs Itself:")
+		for stage in tqdm(eval_queue, desc="Evaluating against previous snapshots opening with first 4 random moves"):
+			# print(f"{ordinal(i + 1)} stage vs {ordinal(stage)} snapshot:" if stage < len(snapshots) else f"{ordinal(i + 1)} stage vs Itself:")
 			opponent = snapshots[stage] if stage < len(snapshots) else model
 			wins, draws, losses = evaluate(board.Board(), agent.Neural(model), agent.Neural(opponent), rounds=eval_rounds, k=4)
 			w, d, l = sum(wins), sum(draws), sum(losses)
-			performance[stage] = (w, d, l)
+			performance[stage] = (w, d, l, wins, draws, losses)
 
 		snapshot_perf.append(performance)
 		
@@ -366,16 +380,17 @@ if __name__ == "__main__":
 		# Save and update stuff
 		mcts_sims = min(mcts_sims * mcts_sims_gamma, mcts_sims_max)
 		torch.save(model.state_dict(), path + f"snapshot_{i + 1}.pth")
+
+		# Save game W/D/L data for analysis
+		with open(path + "log.csv", "w", newline='') as f:
+			writer = csv.writer(f)
+			writer.writerow(["stage", "opponent_stage", "wins_X", "wins_O", "draws_X", "draws_O", "losses_X", "losses_O", "elo_stage", "elo_opponent_stage"])
+			for idx, (perf, elos) in enumerate(zip(snapshot_perf, snapshot_elos)):
+				for op_stage, stats in perf.items():
+					_, _, _, wins, draws, losses = stats
+					writer.writerow([idx + 1, op_stage, wins[0], wins[1], draws[0], draws[1], losses[0], losses[1], elos[idx + 1], elos[op_stage]])
+
 	print()
- 
-	# Save game W/D/L data for analysis
-	with open(path + "log.csv", "w", newline='') as f:
-		writer = csv.writer(f)
-		writer.writerow(["stage", "opponent_stage", "wins", "draws", "losses", "elo_stage", "elo_opponent_stage"])
-		for idx, (perf, elos) in enumerate(zip(snapshot_perf, snapshot_elos)):
-			for op_stage, (wins, draws, losses) in perf.items():
-				writer.writerow([idx + 1, op_stage + 1, wins, draws, losses, elos[idx + 1], elos[op_stage]])
-    
 	print(f"Model and snapshots saved to {path}")
 
 	# Call evaluate.py on the newly trained model folder
